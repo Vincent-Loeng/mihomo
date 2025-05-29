@@ -1,0 +1,84 @@
+name: Build binary files for FreeBSD
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "00 23 * * *"
+  push:
+    branches:
+      - master
+      - hidden
+    paths-ignore:
+      - "**/README.md"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set variables
+        run: |
+          echo "RELEASE_NAME=Alpha-vincent-auto" >> $GITHUB_ENV
+          echo "TAG_NAME=Alpha-vincent-auto" >> $GITHUB_ENV
+          echo "tags=with_gvisor" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Checkout the "hidden" branch
+        uses: actions/checkout@v4
+        with:
+          ref: hidden
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.24.3
+
+      - name: Apply patches
+        run: |
+          git clone --depth 1 https://github.com/MetaCubeX/sing-tun.git sing-tun
+          git clone --depth 1 -b Alpha https://github.com/MetaCubeX/mihomo.git mihomo
+          ls -lha
+          cd sing-tun
+          patch -p1 < ../sing-tun.patch
+          cp monitor_darwin.go monitor_freebsd.go
+          cp tun_darwin_gvisor.go tun_freebsd_gvisor.go
+          sed -i 's|DarwinEndpoint|FreeBSDEndpoint|g;s|darwin|freebsd|g' tun_freebsd_gvisor.go
+          cd ../mihomo
+          patch -p1 < ../mihomo.patch
+          sing_tun_version=$(cat go.mod | grep github.com/metacubex/sing-tun | awk '{ print $2 }')
+          echo -e "\nreplace github.com/metacubex/sing-tun ${sing_tun_version} => ../sing-tun" >> go.mod
+
+      - name: Build binary files
+        run: |
+          cd mihomo
+          os_array=(freebsd)
+          arch_array=(amd64 386 arm64 arm)
+          for os in ${os_array[@]}; do
+            for arch in ${arch_array[@]}; do
+              GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -v -tags ${tags} -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=${RELEASE_NAME}" -X "github.com/metacubex/mihomo/constant.BuildTime=none" -w -s -buildid=' -o mihomo
+              mv mihomo mihomo-${os}-${arch}
+            done
+          done
+
+      - name: Move files to publish directory
+        if: ${{ env.BUILD == 'true' }}
+        run: |
+          mkdir -p publish
+          cp sing-box/sing-box-* ./publish/
+
+      - name: Release and upload assets
+        if: ${{ env.BUILD == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ env.TAG_NAME }}
+          draft: false
+          prerelease: false
+          files: |
+            ./publish/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 3
+          keep_minimum_runs: 6
