@@ -62,7 +62,7 @@ jobs:
         if: ${{ env.BUILD == 'true' }}
         run: |
           mkdir -p publish
-          cp sing-box/sing-box-* ./publish/
+          cp mihomo/mihomo-* ./publish/
 
       - name: Release and upload assets
         if: ${{ env.BUILD == 'true' }}
