@@ -1,4 +1,4 @@
-name: Build binary files for FreeBSD
+name: Build
 on:
   workflow_dispatch:
   schedule:
