@@ -59,13 +59,11 @@ jobs:
           done
 
       - name: Move files to publish directory
-        if: ${{ env.BUILD == 'true' }}
         run: |
           mkdir -p publish
           cp mihomo/mihomo-* ./publish/
 
       - name: Release and upload assets
-        if: ${{ env.BUILD == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ env.RELEASE_NAME }}
