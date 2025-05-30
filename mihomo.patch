@@ -1,8 +1,8 @@
 diff --git a/component/process/process_freebsd_amd64.go b/component/process/process_freebsd.go
-similarity index 91%
+similarity index 89%
 rename from component/process/process_freebsd_amd64.go
 rename to component/process/process_freebsd.go
-index cb43c5ff..41cb499b 100644
+index cb43c5ff..a7ca5c76 100644
 --- a/component/process/process_freebsd_amd64.go
 +++ b/component/process/process_freebsd.go
 @@ -177,33 +177,31 @@ func (s *searcher) searchSocketPid(socket uint64) (uint32, error) {
@@ -64,15 +64,18 @@ index cb43c5ff..41cb499b 100644
  
  	dot := strings.Index(osRelease, ".")
  	if dot != -1 {
-@@ -227,7 +229,7 @@ func initSearcher() error {
+@@ -227,9 +229,9 @@ func initSearcher() error {
  	if err != nil {
  		return err
  	}
 -	defaultSearcher = newSearcher(major)
 +	defaultSearcher = newSearcher(major, machine)
  	if defaultSearcher == nil {
- 		return fmt.Errorf("unsupported freebsd version %d", major)
+-		return fmt.Errorf("unsupported freebsd version %d", major)
++		return fmt.Errorf("unsupported freebsd version %d (%s)", major, machine)
  	}
+ 	return nil
+ }
 diff --git a/component/process/process_other.go b/component/process/process_other.go
 index eea6e5fd..83b6f085 100644
 --- a/component/process/process_other.go
