@@ -87,7 +87,7 @@ index eea6e5fd..83b6f085 100644
  package process
  
 diff --git a/config/config.go b/config/config.go
-index d79ab65c..4dc0c0ca 100644
+index d79ab65c..741f260e 100644
 --- a/config/config.go
 +++ b/config/config.go
 @@ -8,6 +8,7 @@ import (
@@ -106,7 +106,7 @@ index d79ab65c..4dc0c0ca 100644
 +	limitDNS := config.General.Tun.Enable && config.General.Tun.AutoRoute && runtime.GOOS == "freebsd"
 +	if limitDNS {
 +		if dnsCfg.Listen != "127.0.0.1:53" && dnsCfg.Listen != "0.0.0.0:53" {
-+			return nil, fmt.Errorf("the option `dns.listen` should be 127.0.0.1:53 or 0.0.0.0:53 when automatic routing is enabled")
++			return nil, fmt.Errorf("the option `dns.listen` should be 127.0.0.1:53 or 0.0.0.0:53")
 +		}
 +	}
  
