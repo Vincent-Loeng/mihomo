@@ -1,3 +1,9 @@
+**This repo may not be maintained anymore. The tool is enough to speed up some websites, e.g., OpenAI**
+
+精力有限，可能不再维护，目前足以加速某些网站，比如 OpenAI
+
+---
+
 # mihomo for FreeBSD (with tun support)
 
 Automatically build the latest Alpha version with patches
