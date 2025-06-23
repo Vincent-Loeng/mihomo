@@ -1,8 +1,10 @@
 package updater
 
 import (
+	"archive/tar"
 	"archive/zip"
-	"errors"
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -12,134 +14,316 @@ import (
 	"sync"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
-var (
-	ExternalUIURL    string
-	ExternalUIPath   string
-	ExternalUIFolder string
-	ExternalUIName   string
-)
-var (
-	ErrIncompleteConf = errors.New("ExternalUI configure incomplete")
-)
-var xdMutex sync.Mutex
+type UIUpdater struct {
+	externalUIURL  string
+	externalUIPath string
+	autoDownloadUI bool
 
-func UpdateUI() error {
-	xdMutex.Lock()
-	defer xdMutex.Unlock()
+	mutex sync.Mutex
+}
 
-	err := prepare_ui()
+type compressionType int
+
+const (
+	typeUnknown compressionType = iota
+	typeZip
+	typeTarGzip
+)
+
+func (t compressionType) String() string {
+	switch t {
+	case typeZip:
+		return "zip"
+	case typeTarGzip:
+		return "tar.gz"
+	default:
+		return "unknown"
+	}
+}
+
+var DefaultUiUpdater = &UIUpdater{}
+
+func NewUiUpdater(externalUI, externalUIURL, externalUIName string) *UIUpdater {
+	updater := &UIUpdater{}
+	// checkout externalUI exist
+	if externalUI != "" {
+		updater.autoDownloadUI = true
+		updater.externalUIPath = C.Path.Resolve(externalUI)
+	} else {
+		// default externalUI path
+		updater.externalUIPath = path.Join(C.Path.HomeDir(), "ui")
+	}
+
+	// checkout UIpath/name exist
+	if externalUIName != "" {
+		updater.autoDownloadUI = true
+		updater.externalUIPath = path.Join(updater.externalUIPath, externalUIName)
+	}
+
+	if externalUIURL != "" {
+		updater.externalUIURL = externalUIURL
+	}
+	return updater
+}
+
+func (u *UIUpdater) AutoDownloadUI() {
+	u.mutex.Lock()
+	defer u.mutex.Unlock()
+	if u.autoDownloadUI {
+		dirEntries, _ := os.ReadDir(u.externalUIPath)
+		if len(dirEntries) > 0 {
+			log.Infoln("UI already exists, skip downloading")
+		} else {
+			log.Infoln("External UI downloading ...")
+			err := u.downloadUI()
+			if err != nil {
+				log.Errorln("Error downloading UI: %s", err)
+			}
+		}
+	}
+}
+
+func (u *UIUpdater) DownloadUI() error {
+	u.mutex.Lock()
+	defer u.mutex.Unlock()
+	return u.downloadUI()
+}
+
+func detectFileType(data []byte) compressionType {
+	if len(data) < 4 {
+		return typeUnknown
+	}
+
+	// Zip: 0x50 0x4B 0x03 0x04
+	if data[0] == 0x50 && data[1] == 0x4B && data[2] == 0x03 && data[3] == 0x04 {
+		return typeZip
+	}
+
+	// GZip: 0x1F 0x8B
+	if data[0] == 0x1F && data[1] == 0x8B {
+		return typeTarGzip
+	}
+
+	return typeUnknown
+}
+
+func (u *UIUpdater) downloadUI() error {
+	data, err := downloadForBytes(u.externalUIURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("can't download file: %w", err)
 	}
 
-	data, err := downloadForBytes(ExternalUIURL)
+	tmpDir := C.Path.Resolve("downloadUI.tmp")
+	defer os.RemoveAll(tmpDir)
+
+	os.RemoveAll(tmpDir) // cleanup tmp dir before extract
+	log.Debugln("extractedFolder: %s", tmpDir)
+	err = extract(data, tmpDir)
 	if err != nil {
-		return fmt.Errorf("can't download  file: %w", err)
+		return fmt.Errorf("can't extract compressed file: %w", err)
 	}
 
-	saved := path.Join(C.Path.HomeDir(), "download.zip")
-	if err = saveFile(data, saved); err != nil {
-		return fmt.Errorf("can't save zip file: %w", err)
-	}
-	defer os.Remove(saved)
-
-	err = cleanup(ExternalUIFolder)
+	log.Debugln("cleanupFolder: %s", u.externalUIPath)
+	err = cleanup(u.externalUIPath) // cleanup files in dir don't remove dir itself
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("cleanup exist file error: %w", err)
 		}
 	}
 
-	unzipFolder, err := unzip(saved, C.Path.HomeDir())
+	err = u.prepareUIPath()
 	if err != nil {
-		return fmt.Errorf("can't extract zip file: %w", err)
+		return fmt.Errorf("prepare UI path failed: %w", err)
 	}
 
-	err = os.Rename(unzipFolder, ExternalUIFolder)
+	log.Debugln("moveFolder from %s to %s", tmpDir, u.externalUIPath)
+	err = moveDir(tmpDir, u.externalUIPath) // move files from tmp to target
 	if err != nil {
-		return fmt.Errorf("can't rename folder: %w", err)
+		return fmt.Errorf("move UI folder failed: %w", err)
 	}
 	return nil
 }
 
-func prepare_ui() error {
-	if ExternalUIPath == "" || ExternalUIURL == "" {
-		return ErrIncompleteConf
-	}
-
-	if ExternalUIName != "" {
-		ExternalUIFolder = filepath.Clean(path.Join(ExternalUIPath, ExternalUIName))
-		if _, err := os.Stat(ExternalUIPath); os.IsNotExist(err) {
-			if err := os.MkdirAll(ExternalUIPath, os.ModePerm); err != nil {
-				return err
-			}
+func (u *UIUpdater) prepareUIPath() error {
+	if _, err := os.Stat(u.externalUIPath); os.IsNotExist(err) {
+		log.Infoln("dir %s does not exist, creating", u.externalUIPath)
+		if err := os.MkdirAll(u.externalUIPath, os.ModePerm); err != nil {
+			log.Warnln("create dir %s error: %s", u.externalUIPath, err)
 		}
-	} else {
-		ExternalUIFolder = ExternalUIPath
 	}
-
 	return nil
 }
 
-func unzip(src, dest string) (string, error) {
-	r, err := zip.OpenReader(src)
+func unzip(data []byte, dest string) error {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer r.Close()
-	var extractedFolder string
+
+	// check whether or not only exists singleRoot dir
+
 	for _, f := range r.File {
 		fpath := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return "", fmt.Errorf("invalid file path: %s", fpath)
+
+		if !inDest(fpath, dest) {
+			return fmt.Errorf("invalid file path: %s", fpath)
 		}
-		if f.FileInfo().IsDir() {
+		info := f.FileInfo()
+		if info.IsDir() {
 			os.MkdirAll(fpath, os.ModePerm)
 			continue
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue // disallow symlink
+		}
 		if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-			return "", err
+			return err
 		}
 		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 		if err != nil {
-			return "", err
+			return err
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return "", err
+			return err
 		}
 		_, err = io.Copy(outFile, rc)
 		outFile.Close()
 		rc.Close()
 		if err != nil {
-			return "", err
-		}
-		if extractedFolder == "" {
-			extractedFolder = filepath.Dir(fpath)
+			return err
 		}
 	}
-	return extractedFolder, nil
+	return nil
 }
 
-func cleanup(root string) error {
-	if _, err := os.Stat(root); os.IsNotExist(err) {
-		return nil
+func untgz(data []byte, dest string) error {
+	gzr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return err
 	}
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	_ = gzr.Reset(bytes.NewReader(data))
+	tr = tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			if err := os.RemoveAll(path); err != nil {
-				return err
-			}
-		} else {
-			if err := os.Remove(path); err != nil {
-				return err
-			}
+
+		fpath := filepath.Join(dest, header.Name)
+
+		if !inDest(fpath, dest) {
+			return fmt.Errorf("invalid file path: %s", fpath)
 		}
-		return nil
-	})
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err = os.MkdirAll(fpath, os.FileMode(header.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+				return err
+			}
+			outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(outFile, tr); err != nil {
+				outFile.Close()
+				return err
+			}
+			outFile.Close()
+		}
+	}
+	return nil
+}
+
+func extract(data []byte, dest string) error {
+	fileType := detectFileType(data)
+	log.Debugln("compression Type: %s", fileType)
+	switch fileType {
+	case typeZip:
+		return unzip(data, dest)
+	case typeTarGzip:
+		return untgz(data, dest)
+	default:
+		return fmt.Errorf("unknown or unsupported file type")
+	}
+}
+
+func cleanTarPath(path string) string {
+	// remove prefix ./ or ../
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "../")
+
+	// normalize path
+	path = filepath.Clean(path)
+
+	// transfer delimiters to system std
+	path = filepath.FromSlash(path)
+
+	// remove prefix path delimiters
+	path = strings.TrimPrefix(path, string(os.PathSeparator))
+
+	return path
+}
+
+func cleanup(root string) error {
+	dirEntryList, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+
+	for _, dirEntry := range dirEntryList {
+		err = os.RemoveAll(filepath.Join(root, dirEntry.Name()))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func moveDir(src string, dst string) error {
+	dirEntryList, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	if len(dirEntryList) == 1 && dirEntryList[0].IsDir() {
+		src = filepath.Join(src, dirEntryList[0].Name())
+		log.Debugln("match the singleRoot: %s", src)
+		dirEntryList, err = os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+	}
+
+	for _, dirEntry := range dirEntryList {
+		err = os.Rename(filepath.Join(src, dirEntry.Name()), filepath.Join(dst, dirEntry.Name()))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func inDest(fpath, dest string) bool {
+	if rel, err := filepath.Rel(dest, fpath); err == nil {
+		if filepath.IsLocal(rel) {
+			return true
+		}
+	}
+	return false
 }

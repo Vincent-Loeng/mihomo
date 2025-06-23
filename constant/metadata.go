@@ -6,11 +6,15 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-
-	"github.com/metacubex/mihomo/transport/socks5"
 )
 
-// Socks addr type
+// SOCKS address types as defined in RFC 1928 section 5.
+const (
+	AtypIPv4       AddrType = 1
+	AtypDomainName AddrType = 3
+	AtypIPv6       AddrType = 4
+)
+
 const (
 	TCP NetWork = iota
 	UDP
@@ -25,14 +29,32 @@ const (
 	SOCKS5
 	SHADOWSOCKS
 	VMESS
+	VLESS
 	REDIR
 	TPROXY
+	TROJAN
 	TUNNEL
 	TUN
 	TUIC
 	HYSTERIA2
+	ANYTLS
 	INNER
 )
+
+type AddrType byte
+
+func (a AddrType) String() string {
+	switch a {
+	case AtypIPv4:
+		return "IPv4"
+	case AtypDomainName:
+		return "DomainName"
+	case AtypIPv6:
+		return "IPv6"
+	default:
+		return "Unknown"
+	}
+}
 
 type NetWork int
 
@@ -69,10 +91,14 @@ func (t Type) String() string {
 		return "ShadowSocks"
 	case VMESS:
 		return "Vmess"
+	case VLESS:
+		return "Vless"
 	case REDIR:
 		return "Redir"
 	case TPROXY:
 		return "TProxy"
+	case TROJAN:
+		return "Trojan"
 	case TUNNEL:
 		return "Tunnel"
 	case TUN:
@@ -81,6 +107,8 @@ func (t Type) String() string {
 		return "Tuic"
 	case HYSTERIA2:
 		return "Hysteria2"
+	case ANYTLS:
+		return "AnyTLS"
 	case INNER:
 		return "Inner"
 	default:
@@ -103,10 +131,14 @@ func ParseType(t string) (*Type, error) {
 		res = SHADOWSOCKS
 	case "VMESS":
 		res = VMESS
+	case "VLESS":
+		res = VLESS
 	case "REDIR":
 		res = REDIR
 	case "TPROXY":
 		res = TPROXY
+	case "TROJAN":
+		res = TROJAN
 	case "TUNNEL":
 		res = TUNNEL
 	case "TUN":
@@ -115,6 +147,8 @@ func ParseType(t string) (*Type, error) {
 		res = TUIC
 	case "HYSTERIA2":
 		res = HYSTERIA2
+	case "ANYTLS":
+		res = ANYTLS
 	case "INNER":
 		res = INNER
 	default:
@@ -133,7 +167,9 @@ type Metadata struct {
 	Type         Type       `json:"type"`
 	SrcIP        netip.Addr `json:"sourceIP"`
 	DstIP        netip.Addr `json:"destinationIP"`
+	SrcGeoIP     []string   `json:"sourceGeoIP"`      // can be nil if never queried, empty slice if got no result
 	DstGeoIP     []string   `json:"destinationGeoIP"` // can be nil if never queried, empty slice if got no result
+	SrcIPASN     string     `json:"sourceIPASN"`
 	DstIPASN     string     `json:"destinationIPASN"`
 	SrcPort      uint16     `json:"sourcePort,string"`      // `,string` is used to compatible with old version json output
 	DstPort      uint16     `json:"destinationPort,string"` // `,string` is used to compatible with old version json output
@@ -190,14 +226,14 @@ func (m *Metadata) SourceValid() bool {
 	return m.SrcPort != 0 && m.SrcIP.IsValid()
 }
 
-func (m *Metadata) AddrType() int {
+func (m *Metadata) AddrType() AddrType {
 	switch true {
 	case m.Host != "" || !m.DstIP.IsValid():
-		return socks5.AtypDomainName
+		return AtypDomainName
 	case m.DstIP.Is4():
-		return socks5.AtypIPv4
+		return AtypIPv4
 	default:
-		return socks5.AtypIPv6
+		return AtypIPv6
 	}
 }
 
@@ -223,6 +259,11 @@ func (m *Metadata) Pure() *Metadata {
 	}
 
 	return m
+}
+
+func (m *Metadata) Clone() *Metadata {
+	copyM := *m
+	return &copyM
 }
 
 func (m *Metadata) AddrPort() netip.AddrPort {
@@ -299,4 +340,11 @@ func (m *Metadata) SetRemoteAddress(rawAddress string) error {
 	m.DstPort = uint16Port
 
 	return nil
+}
+
+func (m *Metadata) SwapSrcDst() {
+	m.SrcIP, m.DstIP = m.DstIP, m.SrcIP
+	m.SrcPort, m.DstPort = m.DstPort, m.SrcPort
+	m.SrcIPASN, m.DstIPASN = m.DstIPASN, m.SrcIPASN
+	m.SrcGeoIP, m.DstGeoIP = m.DstGeoIP, m.SrcGeoIP
 }

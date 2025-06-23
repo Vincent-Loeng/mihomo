@@ -1,6 +1,8 @@
 package inbound
 
 import (
+	"strings"
+
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/tuic"
@@ -13,6 +15,7 @@ type TuicOption struct {
 	Users                 map[string]string `inbound:"users,omitempty"`
 	Certificate           string            `inbound:"certificate"`
 	PrivateKey            string            `inbound:"private-key"`
+	EchKey                string            `inbound:"ech-key,omitempty"`
 	CongestionController  string            `inbound:"congestion-controller,omitempty"`
 	MaxIdleTime           int               `inbound:"max-idle-time,omitempty"`
 	AuthenticationTimeout int               `inbound:"authentication-timeout,omitempty"`
@@ -48,6 +51,7 @@ func NewTuic(options *TuicOption) (*Tuic, error) {
 			Users:                 options.Users,
 			Certificate:           options.Certificate,
 			PrivateKey:            options.PrivateKey,
+			EchKey:                options.EchKey,
 			CongestionController:  options.CongestionController,
 			MaxIdleTime:           options.MaxIdleTime,
 			AuthenticationTimeout: options.AuthenticationTimeout,
@@ -66,12 +70,13 @@ func (t *Tuic) Config() C.InboundConfig {
 
 // Address implements constant.InboundListener
 func (t *Tuic) Address() string {
+	var addrList []string
 	if t.l != nil {
 		for _, addr := range t.l.AddrList() {
-			return addr.String()
+			addrList = append(addrList, addr.String())
 		}
 	}
-	return ""
+	return strings.Join(addrList, ",")
 }
 
 // Listen implements constant.InboundListener

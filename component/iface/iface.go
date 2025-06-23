@@ -7,13 +7,17 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/singledo"
+
+	"github.com/metacubex/bart"
 )
 
 type Interface struct {
 	Index        int
+	MTU          int
 	Name         string
-	Addrs        []netip.Prefix
 	HardwareAddr net.HardwareAddr
+	Flags        net.Flags
+	Addresses    []netip.Prefix
 }
 
 var (
@@ -21,16 +25,25 @@ var (
 	ErrAddrNotFound  = errors.New("addr not found")
 )
 
-var interfaces = singledo.NewSingle[map[string]*Interface](time.Second * 20)
+type ifaceCache struct {
+	ifMapByName map[string]*Interface
+	ifMapByAddr map[netip.Addr]*Interface
+	ifTable     bart.Table[*Interface]
+}
 
-func Interfaces() (map[string]*Interface, error) {
-	value, err, _ := interfaces.Do(func() (map[string]*Interface, error) {
+var caches = singledo.NewSingle[*ifaceCache](time.Second * 20)
+
+func getCache() (*ifaceCache, error) {
+	value, err, _ := caches.Do(func() (*ifaceCache, error) {
 		ifaces, err := net.Interfaces()
 		if err != nil {
 			return nil, err
 		}
 
-		r := map[string]*Interface{}
+		cache := &ifaceCache{
+			ifMapByName: make(map[string]*Interface),
+			ifMapByAddr: make(map[netip.Addr]*Interface),
+		}
 
 		for _, iface := range ifaces {
 			addrs, err := iface.Addrs()
@@ -59,17 +72,36 @@ func Interfaces() (map[string]*Interface, error) {
 				}
 			}
 
-			r[iface.Name] = &Interface{
+			ifaceObj := &Interface{
 				Index:        iface.Index,
+				MTU:          iface.MTU,
 				Name:         iface.Name,
-				Addrs:        ipNets,
 				HardwareAddr: iface.HardwareAddr,
+				Flags:        iface.Flags,
+				Addresses:    ipNets,
+			}
+			cache.ifMapByName[iface.Name] = ifaceObj
+
+			if iface.Flags&net.FlagUp == 0 {
+				continue // interface down
+			}
+			for _, prefix := range ipNets {
+				cache.ifMapByAddr[prefix.Addr()] = ifaceObj
+				cache.ifTable.Insert(prefix, ifaceObj)
 			}
 		}
 
-		return r, nil
+		return cache, nil
 	})
 	return value, err
+}
+
+func Interfaces() (map[string]*Interface, error) {
+	cache, err := getCache()
+	if err != nil {
+		return nil, err
+	}
+	return cache.ifMapByName, nil
 }
 
 func ResolveInterface(name string) (*Interface, error) {
@@ -86,23 +118,35 @@ func ResolveInterface(name string) (*Interface, error) {
 	return iface, nil
 }
 
-func IsLocalIp(ip netip.Addr) (bool, error) {
-	ifaces, err := Interfaces()
+func ResolveInterfaceByAddr(addr netip.Addr) (*Interface, error) {
+	cache, err := getCache()
+	if err != nil {
+		return nil, err
+	}
+	// maybe two interfaces have the same prefix but different address
+	// so direct check address equal before do a route lookup (longest prefix match)
+	if iface, ok := cache.ifMapByAddr[addr]; ok {
+		return iface, nil
+	}
+	iface, ok := cache.ifTable.Lookup(addr)
+	if !ok {
+		return nil, ErrIfaceNotFound
+	}
+
+	return iface, nil
+}
+
+func IsLocalIp(addr netip.Addr) (bool, error) {
+	cache, err := getCache()
 	if err != nil {
 		return false, err
 	}
-	for _, iface := range ifaces {
-		for _, addr := range iface.Addrs {
-			if addr.Contains(ip) {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
+	_, ok := cache.ifMapByAddr[addr]
+	return ok, nil
 }
 
 func FlushCache() {
-	interfaces.Reset()
+	caches.Reset()
 }
 
 func (iface *Interface) PickIPv4Addr(destination netip.Addr) (netip.Prefix, error) {
@@ -120,7 +164,7 @@ func (iface *Interface) PickIPv6Addr(destination netip.Addr) (netip.Prefix, erro
 func (iface *Interface) pickIPAddr(destination netip.Addr, accept func(addr netip.Prefix) bool) (netip.Prefix, error) {
 	var fallback netip.Prefix
 
-	for _, addr := range iface.Addrs {
+	for _, addr := range iface.Addresses {
 		if !accept(addr) {
 			continue
 		}

@@ -116,4 +116,10 @@ type Rule interface {
 	Payload() string
 	ShouldResolveIP() bool
 	ShouldFindProcess() bool
+	ProviderNames() []string
+}
+
+type RuleGroup interface {
+	Rule
+	GetRecodeSize() int
 }

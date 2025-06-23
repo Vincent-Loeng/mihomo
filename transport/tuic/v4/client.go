@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"net"
 	"runtime"
@@ -15,17 +14,18 @@ import (
 	atomic2 "github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/pool"
+	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/tuic/common"
 
 	"github.com/metacubex/quic-go"
+	"github.com/metacubex/randv2"
 	"github.com/puzpuzpuz/xsync/v3"
-	"github.com/zhangyunhao116/fastrand"
 )
 
 type ClientOption struct {
-	TlsConfig             *tls.Config
+	TlsConfig             *tlsC.Config
 	QuicConfig            *quic.Config
 	Token                 [32]byte
 	UdpRelayMode          common.UdpRelayMode
@@ -367,7 +367,7 @@ func (t *clientImpl) ListenPacketWithDialer(ctx context.Context, metadata *C.Met
 	pipe1, pipe2 := N.Pipe()
 	var connId uint32
 	for {
-		connId = fastrand.Uint32()
+		connId = randv2.Uint32()
 		_, loaded := t.udpInputMap.LoadOrStore(connId, pipe1)
 		if !loaded {
 			break

@@ -10,6 +10,12 @@ type Sniffer interface {
 	SupportPort(port uint16) bool
 }
 
+type ReplaceDomain func(metadata *constant.Metadata, host string)
+
+type MultiPacketSniffer interface {
+	WrapperSender(packetSender constant.PacketSender, replaceDomain ReplaceDomain) constant.PacketSender
+}
+
 const (
 	TLS Type = iota
 	HTTP

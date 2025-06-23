@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
-	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/sockopt"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -19,11 +18,12 @@ import (
 	shadowsocks "github.com/metacubex/sing-shadowsocks"
 	"github.com/metacubex/sing-shadowsocks/shadowaead"
 	"github.com/metacubex/sing-shadowsocks/shadowaead_2022"
-	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
-	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/network"
+	shadowtls "github.com/metacubex/sing-shadowtls"
+	"github.com/metacubex/sing/common"
+	"github.com/metacubex/sing/common/buf"
+	"github.com/metacubex/sing/common/bufio"
+	M "github.com/metacubex/sing/common/metadata"
+	"github.com/metacubex/sing/common/network"
 )
 
 type Listener struct {
@@ -32,9 +32,23 @@ type Listener struct {
 	listeners    []net.Listener
 	udpListeners []net.PacketConn
 	service      shadowsocks.Service
+	shadowTLS    *shadowtls.Service
 }
 
 var _listener *Listener
+
+// shadowTLSService is a wrapper for shadowsocks.Service to support shadowTLS.
+type shadowTLSService struct {
+	shadowsocks.Service
+	shadowTLS *shadowtls.Service
+}
+
+func (s *shadowTLSService) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
+	if s.shadowTLS != nil {
+		return s.shadowTLS.NewConnection(ctx, conn, metadata)
+	}
+	return s.Service.NewConnection(ctx, conn, metadata)
+}
 
 func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addition) (C.MultiAddrListener, error) {
 	var sl *Listener
@@ -61,7 +75,8 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 		return nil, err
 	}
 
-	sl = &Listener{false, config, nil, nil, nil}
+	sl = &Listener{}
+	sl.config = config
 
 	switch {
 	case config.Cipher == shadowsocks.MethodNone:
@@ -72,10 +87,55 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 		sl.service, err = shadowaead_2022.NewServiceWithPassword(config.Cipher, config.Password, udpTimeout, h, ntp.Now)
 	default:
 		err = fmt.Errorf("shadowsocks: unsupported method: %s", config.Cipher)
-		return embedSS.New(config, tunnel)
+		return embedSS.New(config, tunnel, additions...)
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	if config.ShadowTLS.Enable {
+		buildHandshake := func(handshake LC.ShadowTLSHandshakeOptions) (handshakeConfig shadowtls.HandshakeConfig) {
+			handshakeConfig.Server = M.ParseSocksaddr(handshake.Dest)
+			handshakeConfig.Dialer = sing.NewDialer(tunnel, handshake.Proxy)
+			return
+		}
+		var handshakeForServerName map[string]shadowtls.HandshakeConfig
+		if config.ShadowTLS.Version > 1 {
+			handshakeForServerName = make(map[string]shadowtls.HandshakeConfig)
+			for serverName, serverOptions := range config.ShadowTLS.HandshakeForServerName {
+				handshakeForServerName[serverName] = buildHandshake(serverOptions)
+			}
+		}
+		var wildcardSNI shadowtls.WildcardSNI
+		switch config.ShadowTLS.WildcardSNI {
+		case "authed":
+			wildcardSNI = shadowtls.WildcardSNIAuthed
+		case "all":
+			wildcardSNI = shadowtls.WildcardSNIAll
+		default:
+			wildcardSNI = shadowtls.WildcardSNIOff
+		}
+		var shadowTLS *shadowtls.Service
+		shadowTLS, err = shadowtls.NewService(shadowtls.ServiceConfig{
+			Version:  config.ShadowTLS.Version,
+			Password: config.ShadowTLS.Password,
+			Users: common.Map(config.ShadowTLS.Users, func(it LC.ShadowTLSUser) shadowtls.User {
+				return shadowtls.User{Name: it.Name, Password: it.Password}
+			}),
+			Handshake:              buildHandshake(config.ShadowTLS.Handshake),
+			HandshakeForServerName: handshakeForServerName,
+			StrictMode:             config.ShadowTLS.StrictMode,
+			WildcardSNI:            wildcardSNI,
+			Handler:                sl.service,
+			Logger:                 log.SingLogger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		sl.service = &shadowTLSService{
+			Service:   sl.service,
+			shadowTLS: shadowTLS,
+		}
 	}
 
 	for _, addr := range strings.Split(config.Listen, ",") {
@@ -83,13 +143,12 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 
 		if config.Udp {
 			//UDP
-			ul, err := net.ListenPacket("udp", addr)
+			ul, err := inbound.ListenPacket("udp", addr)
 			if err != nil {
 				return nil, err
 			}
 
-			err = sockopt.UDPReuseaddr(ul.(*net.UDPConn))
-			if err != nil {
+			if err := sockopt.UDPReuseaddr(ul); err != nil {
 				log.Warnln("Failed to Reuse UDP Address: %s", err)
 			}
 
@@ -97,11 +156,7 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 
 			go func() {
 				conn := bufio.NewPacketConn(ul)
-				rwOptions := network.ReadWaitOptions{
-					FrontHeadroom: network.CalculateFrontHeadroom(sl.service),
-					RearHeadroom:  network.CalculateRearHeadroom(sl.service),
-					MTU:           network.CalculateMTU(conn, sl.service),
-				}
+				rwOptions := network.NewReadWaitOptions(conn, sl.service)
 				readWaiter, isReadWaiter := bufio.CreatePacketReadWaiter(conn)
 				if isReadWaiter {
 					readWaiter.InitializeReadWaiter(rwOptions)
@@ -129,7 +184,9 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 						}
 						continue
 					}
-					_ = sl.service.NewPacket(context.TODO(), conn, buff, M.Metadata{
+					ctx := context.TODO()
+					ctx = sing.WithInAddr(ctx, ul.LocalAddr())
+					_ = sl.service.NewPacket(ctx, conn, buff, M.Metadata{
 						Protocol: "shadowsocks",
 						Source:   dest,
 					})
@@ -153,7 +210,6 @@ func New(config LC.ShadowsocksServer, tunnel C.Tunnel, additions ...inbound.Addi
 					}
 					continue
 				}
-				N.TCPKeepAlive(c)
 
 				go sl.HandleConn(c, tunnel)
 			}
@@ -199,7 +255,7 @@ func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbou
 	ctx := sing.WithAdditions(context.TODO(), additions...)
 	err := l.service.NewConnection(ctx, conn, M.Metadata{
 		Protocol: "shadowsocks",
-		Source:   M.ParseSocksaddr(conn.RemoteAddr().String()),
+		Source:   M.SocksaddrFromNet(conn.RemoteAddr()),
 	})
 	if err != nil {
 		_ = conn.Close()

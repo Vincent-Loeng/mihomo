@@ -9,12 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/callback"
 	"github.com/metacubex/mihomo/common/lru"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
-	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/provider"
 
@@ -88,14 +86,14 @@ func jumpHash(key uint64, buckets int32) int32 {
 }
 
 // DialContext implements C.ProxyAdapter
-func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (c C.Conn, err error) {
+func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxy := lb.Unwrap(metadata, true)
-	c, err = proxy.DialContext(ctx, metadata, lb.Base.DialOptions(opts...)...)
+	c, err = proxy.DialContext(ctx, metadata)
 
 	if err == nil {
 		c.AppendToChains(lb)
 	} else {
-		lb.onDialFailed(proxy.Type(), err)
+		lb.onDialFailed(proxy.Type(), err, lb.healthCheck)
 	}
 
 	if N.NeedHandshake(c) {
@@ -103,7 +101,7 @@ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata, op
 			if err == nil {
 				lb.onDialSuccess()
 			} else {
-				lb.onDialFailed(proxy.Type(), err)
+				lb.onDialFailed(proxy.Type(), err, lb.healthCheck)
 			}
 		})
 	}
@@ -112,7 +110,7 @@ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata, op
 }
 
 // ListenPacketContext implements C.ProxyAdapter
-func (lb *LoadBalance) ListenPacketContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (pc C.PacketConn, err error) {
+func (lb *LoadBalance) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
 	defer func() {
 		if err == nil {
 			pc.AppendToChains(lb)
@@ -120,7 +118,7 @@ func (lb *LoadBalance) ListenPacketContext(ctx context.Context, metadata *C.Meta
 	}()
 
 	proxy := lb.Unwrap(metadata, true)
-	return proxy.ListenPacketContext(ctx, metadata, lb.Base.DialOptions(opts...)...)
+	return proxy.ListenPacketContext(ctx, metadata)
 }
 
 // SupportUDP implements C.ProxyAdapter
@@ -204,8 +202,7 @@ func strategyStickySessions(url string) strategyFn {
 		for i := 1; i < maxRetry; i++ {
 			proxy := proxies[nowIdx]
 			if proxy.AliveForTestUrl(url) {
-				if nowIdx != idx {
-					lruCache.Delete(key)
+				if !has || nowIdx != idx {
 					lruCache.Set(key, nowIdx)
 				}
 
@@ -215,7 +212,6 @@ func strategyStickySessions(url string) strategyFn {
 			}
 		}
 
-		lruCache.Delete(key)
 		lruCache.Set(key, 0)
 		return proxies[0]
 	}
@@ -257,18 +253,14 @@ func NewLoadBalance(option *GroupCommonOption, providers []provider.ProxyProvide
 	}
 	return &LoadBalance{
 		GroupBase: NewGroupBase(GroupBaseOption{
-			outbound.BaseOption{
-				Name:        option.Name,
-				Type:        C.LoadBalance,
-				Interface:   option.Interface,
-				RoutingMark: option.RoutingMark,
-			},
-			option.Filter,
-			option.ExcludeFilter,
-			option.ExcludeType,
-			option.TestTimeout,
-			option.MaxFailedTimes,
-			providers,
+			Name:           option.Name,
+			Type:           C.LoadBalance,
+			Filter:         option.Filter,
+			ExcludeFilter:  option.ExcludeFilter,
+			ExcludeType:    option.ExcludeType,
+			TestTimeout:    option.TestTimeout,
+			MaxFailedTimes: option.MaxFailedTimes,
+			Providers:      providers,
 		}),
 		strategyFn:     strategyFn,
 		disableUDP:     option.DisableUDP,

@@ -2,24 +2,20 @@ package outbound
 
 import (
 	"context"
-	"errors"
-	"runtime"
 
 	CN "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
-	mux "github.com/sagernet/sing-mux"
-	E "github.com/sagernet/sing/common/exceptions"
-	M "github.com/sagernet/sing/common/metadata"
+	mux "github.com/metacubex/sing-mux"
+	E "github.com/metacubex/sing/common/exceptions"
+	M "github.com/metacubex/sing/common/metadata"
 )
 
 type SingMux struct {
-	C.ProxyAdapter
-	base    ProxyBase
+	ProxyAdapter
 	client  *mux.Client
 	dialer  proxydialer.SingDialer
 	onlyTcp bool
@@ -43,36 +39,21 @@ type BrutalOption struct {
 	Down    string `proxy:"down,omitempty"`
 }
 
-type ProxyBase interface {
-	DialOptions(opts ...dialer.Option) []dialer.Option
-}
-
-func (s *SingMux) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (_ C.Conn, err error) {
-	options := s.base.DialOptions(opts...)
-	s.dialer.SetDialer(dialer.NewDialer(options...))
+func (s *SingMux) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	c, err := s.client.DialContext(ctx, "tcp", M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
 	}
-	return NewConn(CN.NewRefConn(c, s), s.ProxyAdapter), err
+	return NewConn(c, s), err
 }
 
-func (s *SingMux) ListenPacketContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (_ C.PacketConn, err error) {
+func (s *SingMux) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if s.onlyTcp {
-		return s.ProxyAdapter.ListenPacketContext(ctx, metadata, opts...)
+		return s.ProxyAdapter.ListenPacketContext(ctx, metadata)
 	}
-	options := s.base.DialOptions(opts...)
-	s.dialer.SetDialer(dialer.NewDialer(options...))
-
-	// sing-mux use stream-oriented udp with a special address, so we need a net.UDPAddr
-	if !metadata.Resolved() {
-		ip, err := resolver.ResolveIP(ctx, metadata.Host)
-		if err != nil {
-			return nil, errors.New("can't resolve ip")
-		}
-		metadata.DstIP = ip
+	if err = s.ProxyAdapter.ResolveUDP(ctx, metadata); err != nil {
+		return nil, err
 	}
-
 	pc, err := s.client.ListenPacket(ctx, M.SocksaddrFromNet(metadata.UDPAddr()))
 	if err != nil {
 		return nil, err
@@ -80,7 +61,7 @@ func (s *SingMux) ListenPacketContext(ctx context.Context, metadata *C.Metadata,
 	if pc == nil {
 		return nil, E.New("packetConn is nil")
 	}
-	return newPacketConn(CN.NewRefPacketConn(CN.NewThreadSafePacketConn(pc), s), s.ProxyAdapter), nil
+	return newPacketConn(CN.NewThreadSafePacketConn(pc), s), nil
 }
 
 func (s *SingMux) SupportUDP() bool {
@@ -97,15 +78,25 @@ func (s *SingMux) SupportUOT() bool {
 	return true
 }
 
-func closeSingMux(s *SingMux) {
-	_ = s.client.Close()
+func (s *SingMux) ProxyInfo() C.ProxyInfo {
+	info := s.ProxyAdapter.ProxyInfo()
+	info.SMUX = true
+	return info
 }
 
-func NewSingMux(option SingMuxOption, proxy C.ProxyAdapter, base ProxyBase) (C.ProxyAdapter, error) {
+// Close implements C.ProxyAdapter
+func (s *SingMux) Close() error {
+	if s.client != nil {
+		_ = s.client.Close()
+	}
+	return s.ProxyAdapter.Close()
+}
+
+func NewSingMux(option SingMuxOption, proxy ProxyAdapter) (ProxyAdapter, error) {
 	// TODO
 	// "TCP Brutal is only supported on Linux-based systems"
 
-	singDialer := proxydialer.NewSingDialer(proxy, dialer.NewDialer(), option.Statistic)
+	singDialer := proxydialer.NewSingDialer(proxy, dialer.NewDialer(proxy.DialOptions()...), option.Statistic)
 	client, err := mux.NewClient(mux.Options{
 		Dialer:         singDialer,
 		Logger:         log.SingLogger,
@@ -125,11 +116,9 @@ func NewSingMux(option SingMuxOption, proxy C.ProxyAdapter, base ProxyBase) (C.P
 	}
 	outbound := &SingMux{
 		ProxyAdapter: proxy,
-		base:         base,
 		client:       client,
 		dialer:       singDialer,
 		onlyTcp:      option.OnlyTcp,
 	}
-	runtime.SetFinalizer(outbound, closeSingMux)
 	return outbound, nil
 }

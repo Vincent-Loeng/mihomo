@@ -3,15 +3,25 @@ package outbound
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
-	"strings"
+	"runtime"
+	"sync"
 	"syscall"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
+
+type ProxyAdapter interface {
+	C.ProxyAdapter
+	DialOptions() []dialer.Option
+	ResolveUDP(ctx context.Context, metadata *C.Metadata) error
+}
 
 type Base struct {
 	name   string
@@ -51,7 +61,7 @@ func (b *Base) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Me
 	return c, C.ErrNotSupport
 }
 
-func (b *Base) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.Conn, error) {
+func (b *Base) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	return nil, C.ErrNotSupport
 }
 
@@ -61,7 +71,7 @@ func (b *Base) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metad
 }
 
 // ListenPacketContext implements C.ProxyAdapter
-func (b *Base) ListenPacketContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.PacketConn, error) {
+func (b *Base) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	return nil, C.ErrNotSupport
 }
 
@@ -85,14 +95,15 @@ func (b *Base) SupportUDP() bool {
 	return b.udp
 }
 
-// SupportXUDP implements C.ProxyAdapter
-func (b *Base) SupportXUDP() bool {
-	return b.xudp
-}
-
-// SupportTFO implements C.ProxyAdapter
-func (b *Base) SupportTFO() bool {
-	return b.tfo
+// ProxyInfo implements C.ProxyAdapter
+func (b *Base) ProxyInfo() (info C.ProxyInfo) {
+	info.XUDP = b.xudp
+	info.TFO = b.tfo
+	info.MPTCP = b.mpTcp
+	info.SMUX = false
+	info.Interface = b.iface
+	info.RoutingMark = b.rmark
+	return
 }
 
 // IsL3Protocol implements C.ProxyAdapter
@@ -119,7 +130,7 @@ func (b *Base) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 }
 
 // DialOptions return []dialer.Option from struct
-func (b *Base) DialOptions(opts ...dialer.Option) []dialer.Option {
+func (b *Base) DialOptions() (opts []dialer.Option) {
 	if b.iface != "" {
 		opts = append(opts, dialer.WithInterface(b.iface))
 	}
@@ -151,12 +162,27 @@ func (b *Base) DialOptions(opts ...dialer.Option) []dialer.Option {
 	return opts
 }
 
+func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if !metadata.Resolved() {
+		ip, err := resolver.ResolveIP(ctx, metadata.Host)
+		if err != nil {
+			return fmt.Errorf("can't resolve ip: %w", err)
+		}
+		metadata.DstIP = ip
+	}
+	return nil
+}
+
+func (b *Base) Close() error {
+	return nil
+}
+
 type BasicOption struct {
-	TFO         bool   `proxy:"tfo,omitempty" group:"tfo,omitempty"`
-	MPTCP       bool   `proxy:"mptcp,omitempty" group:"mptcp,omitempty"`
-	Interface   string `proxy:"interface-name,omitempty" group:"interface-name,omitempty"`
-	RoutingMark int    `proxy:"routing-mark,omitempty" group:"routing-mark,omitempty"`
-	IPVersion   string `proxy:"ip-version,omitempty" group:"ip-version,omitempty"`
+	TFO         bool   `proxy:"tfo,omitempty"`
+	MPTCP       bool   `proxy:"mptcp,omitempty"`
+	Interface   string `proxy:"interface-name,omitempty"`
+	RoutingMark int    `proxy:"routing-mark,omitempty"`
+	IPVersion   string `proxy:"ip-version,omitempty"`
 	DialerProxy string `proxy:"dialer-proxy,omitempty"` // don't apply this option into groups, but can set a group name in a proxy
 }
 
@@ -190,12 +216,21 @@ func NewBase(opt BaseOption) *Base {
 
 type conn struct {
 	N.ExtendedConn
-	chain                   C.Chain
-	actualRemoteDestination string
+	chain       C.Chain
+	adapterAddr string
 }
 
 func (c *conn) RemoteDestination() string {
-	return c.actualRemoteDestination
+	if remoteAddr := c.RemoteAddr(); remoteAddr != nil {
+		m := C.Metadata{}
+		if err := m.SetRemoteAddr(remoteAddr); err != nil {
+			if m.Valid() {
+				return m.String()
+			}
+		}
+	}
+	host, _, _ := net.SplitHostPort(c.adapterAddr)
+	return host
 }
 
 // Chains implements C.Connection
@@ -220,23 +255,33 @@ func (c *conn) ReaderReplaceable() bool {
 	return true
 }
 
+func (c *conn) AddRef(ref any) {
+	c.ExtendedConn = N.NewRefConn(c.ExtendedConn, ref) // add ref for autoCloseProxyAdapter
+}
+
 func NewConn(c net.Conn, a C.ProxyAdapter) C.Conn {
 	if _, ok := c.(syscall.Conn); !ok { // exclusion system conn like *net.TCPConn
 		c = N.NewDeadlineConn(c) // most conn from outbound can't handle readDeadline correctly
 	}
-	return &conn{N.NewExtendedConn(c), []string{a.Name()}, parseRemoteDestination(a.Addr())}
+	return &conn{N.NewExtendedConn(c), []string{a.Name()}, a.Addr()}
 }
 
 type packetConn struct {
 	N.EnhancePacketConn
-	chain                   C.Chain
-	adapterName             string
-	connID                  string
-	actualRemoteDestination string
+	chain       C.Chain
+	adapterName string
+	connID      string
+	adapterAddr string
+	resolveUDP  func(ctx context.Context, metadata *C.Metadata) error
+}
+
+func (c *packetConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	return c.resolveUDP(ctx, metadata)
 }
 
 func (c *packetConn) RemoteDestination() string {
-	return c.actualRemoteDestination
+	host, _, _ := net.SplitHostPort(c.adapterAddr)
+	return host
 }
 
 // Chains implements C.Connection
@@ -266,22 +311,86 @@ func (c *packetConn) ReaderReplaceable() bool {
 	return true
 }
 
-func newPacketConn(pc net.PacketConn, a C.ProxyAdapter) C.PacketConn {
+func (c *packetConn) AddRef(ref any) {
+	c.EnhancePacketConn = N.NewRefPacketConn(c.EnhancePacketConn, ref) // add ref for autoCloseProxyAdapter
+}
+
+func newPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
 	epc := N.NewEnhancePacketConn(pc)
 	if _, ok := pc.(syscall.Conn); !ok { // exclusion system conn like *net.UDPConn
 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
 	}
-	return &packetConn{epc, []string{a.Name()}, a.Name(), utils.NewUUIDV4().String(), parseRemoteDestination(a.Addr())}
+	return &packetConn{epc, []string{a.Name()}, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
 }
 
-func parseRemoteDestination(addr string) string {
-	if dst, _, err := net.SplitHostPort(addr); err == nil {
-		return dst
-	} else {
-		if addrError, ok := err.(*net.AddrError); ok && strings.Contains(addrError.Err, "missing port") {
-			return dst
-		} else {
-			return ""
-		}
+type AddRef interface {
+	AddRef(ref any)
+}
+
+type autoCloseProxyAdapter struct {
+	ProxyAdapter
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
+	if err != nil {
+		return nil, err
 	}
+	if c, ok := c.(AddRef); ok {
+		c.AddRef(p)
+	}
+	return c, nil
+}
+
+func (p *autoCloseProxyAdapter) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
+	c, err := p.ProxyAdapter.DialContextWithDialer(ctx, dialer, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if c, ok := c.(AddRef); ok {
+		c.AddRef(p)
+	}
+	return c, nil
+}
+
+func (p *autoCloseProxyAdapter) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if pc, ok := pc.(AddRef); ok {
+		pc.AddRef(p)
+	}
+	return pc, nil
+}
+
+func (p *autoCloseProxyAdapter) ListenPacketWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	pc, err := p.ProxyAdapter.ListenPacketWithDialer(ctx, dialer, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if pc, ok := pc.(AddRef); ok {
+		pc.AddRef(p)
+	}
+	return pc, nil
+}
+
+func (p *autoCloseProxyAdapter) Close() error {
+	p.closeOnce.Do(func() {
+		log.Debugln("Closing outdated proxy [%s]", p.Name())
+		runtime.SetFinalizer(p, nil)
+		p.closeErr = p.ProxyAdapter.Close()
+	})
+	return p.closeErr
+}
+
+func NewAutoCloseProxyAdapter(adapter ProxyAdapter) ProxyAdapter {
+	proxy := &autoCloseProxyAdapter{
+		ProxyAdapter: adapter,
+	}
+	// auto close ProxyAdapter
+	runtime.SetFinalizer(proxy, (*autoCloseProxyAdapter).Close)
+	return proxy
 }

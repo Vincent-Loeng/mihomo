@@ -9,9 +9,8 @@ import (
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	"github.com/metacubex/mihomo/log"
 
-	utls "github.com/metacubex/utls"
-	"github.com/sagernet/sing-shadowtls"
-	sing_common "github.com/sagernet/sing/common"
+	"github.com/metacubex/sing-shadowtls"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -20,6 +19,7 @@ const (
 
 var (
 	DefaultALPN = []string{"h2", "http/1.1"}
+	WsALPN      = []string{"http/1.1"}
 )
 
 type ShadowTLSOption struct {
@@ -29,14 +29,18 @@ type ShadowTLSOption struct {
 	ClientFingerprint string
 	SkipCertVerify    bool
 	Version           int
+	ALPN              []string
 }
 
 func NewShadowTLS(ctx context.Context, conn net.Conn, option *ShadowTLSOption) (net.Conn, error) {
 	tlsConfig := &tls.Config{
-		NextProtos:         DefaultALPN,
+		NextProtos:         option.ALPN,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: option.SkipCertVerify,
 		ServerName:         option.Host,
+	}
+	if option.Version == 1 {
+		tlsConfig.MaxVersion = tls.VersionTLS12 // ShadowTLS v1 only support TLS 1.2
 	}
 
 	var err error
@@ -45,12 +49,7 @@ func NewShadowTLS(ctx context.Context, conn net.Conn, option *ShadowTLSOption) (
 		return nil, err
 	}
 
-	tlsHandshake := shadowtls.DefaultTLSHandshakeFunc(option.Password, tlsConfig)
-	if len(option.ClientFingerprint) != 0 {
-		if fingerprint, exists := tlsC.GetFingerprint(option.ClientFingerprint); exists {
-			tlsHandshake = uTLSHandshakeFunc(tlsConfig, *fingerprint.ClientHelloID)
-		}
-	}
+	tlsHandshake := uTLSHandshakeFunc(tlsConfig, option.ClientFingerprint, option.Version)
 	client, err := shadowtls.NewClient(shadowtls.ClientConfig{
 		Version:      option.Version,
 		Password:     option.Password,
@@ -63,27 +62,29 @@ func NewShadowTLS(ctx context.Context, conn net.Conn, option *ShadowTLSOption) (
 	return client.DialContextConn(ctx, conn)
 }
 
-func uTLSHandshakeFunc(config *tls.Config, clientHelloID utls.ClientHelloID) shadowtls.TLSHandshakeFunc {
+func uTLSHandshakeFunc(config *tls.Config, clientFingerprint string, version int) shadowtls.TLSHandshakeFunc {
 	return func(ctx context.Context, conn net.Conn, sessionIDGenerator shadowtls.TLSSessionIDGeneratorFunc) error {
-		tlsConfig := &utls.Config{
-			Rand:                  config.Rand,
-			Time:                  config.Time,
-			VerifyPeerCertificate: config.VerifyPeerCertificate,
-			RootCAs:               config.RootCAs,
-			NextProtos:            config.NextProtos,
-			ServerName:            config.ServerName,
-			InsecureSkipVerify:    config.InsecureSkipVerify,
-			CipherSuites:          config.CipherSuites,
-			MinVersion:            config.MinVersion,
-			MaxVersion:            config.MaxVersion,
-			CurvePreferences: sing_common.Map(config.CurvePreferences, func(it tls.CurveID) utls.CurveID {
-				return utls.CurveID(it)
-			}),
-			SessionTicketsDisabled: config.SessionTicketsDisabled,
-			Renegotiation:          utls.RenegotiationSupport(config.Renegotiation),
-			SessionIDGenerator:     sessionIDGenerator,
+		tlsConfig := tlsC.UConfig(config)
+		tlsConfig.SessionIDGenerator = sessionIDGenerator
+		if version == 1 {
+			tlsConfig.MaxVersion = tlsC.VersionTLS12 // ShadowTLS v1 only support TLS 1.2
+			tlsConn := tlsC.Client(conn, tlsConfig)
+			return tlsConn.HandshakeContext(ctx)
 		}
-		tlsConn := utls.UClient(conn, tlsConfig, clientHelloID)
+		if clientFingerprint, ok := tlsC.GetFingerprint(clientFingerprint); ok {
+			if version == 2 && clientFingerprint == tlsC.HelloChrome_Auto {
+				clientFingerprint = tlsC.HelloChrome_120 // ShadowTLS v2 not work with X25519MLKEM768
+			}
+			tlsConn := tlsC.UClient(conn, tlsConfig, clientFingerprint)
+			if slices.Equal(tlsConfig.NextProtos, WsALPN) {
+				err := tlsC.BuildWebsocketHandshakeState(tlsConn)
+				if err != nil {
+					return err
+				}
+			}
+			return tlsConn.HandshakeContext(ctx)
+		}
+		tlsConn := tlsC.Client(conn, tlsConfig)
 		return tlsConn.HandshakeContext(ctx)
 	}
 }

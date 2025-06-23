@@ -7,18 +7,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"strconv"
 	"strings"
 	"time"
 
-	N "github.com/metacubex/mihomo/common/net"
-	"github.com/metacubex/mihomo/common/nnip"
 	"github.com/metacubex/mihomo/common/picker"
-	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
-	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mihomo/tunnel"
 
 	D "github.com/miekg/dns"
 	"github.com/samber/lo"
@@ -130,12 +124,9 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 				UDPSize: 4096,
 				Timeout: 5 * time.Second,
 			},
-			port:         port,
-			host:         host,
-			iface:        s.Interface,
-			r:            resolver,
-			proxyAdapter: s.ProxyAdapter,
-			proxyName:    s.ProxyName,
+			port:   port,
+			host:   host,
+			dialer: newDNSDialer(resolver, s.ProxyAdapter, s.ProxyName),
 		})
 	}
 	return ret
@@ -152,19 +143,24 @@ func handleMsgWithEmptyAnswer(r *D.Msg) *D.Msg {
 	return msg
 }
 
-func msgToIP(msg *D.Msg) []netip.Addr {
-	ips := []netip.Addr{}
-
+func msgToIP(msg *D.Msg) (ips []netip.Addr) {
 	for _, answer := range msg.Answer {
+		var ip netip.Addr
 		switch ans := answer.(type) {
 		case *D.AAAA:
-			ips = append(ips, nnip.IpToAddr(ans.AAAA))
+			ip, _ = netip.AddrFromSlice(ans.AAAA)
 		case *D.A:
-			ips = append(ips, nnip.IpToAddr(ans.A))
+			ip, _ = netip.AddrFromSlice(ans.A)
+		default:
+			continue
 		}
+		if !ip.IsValid() {
+			continue
+		}
+		ip = ip.Unmap()
+		ips = append(ips, ip)
 	}
-
-	return ips
+	return
 }
 
 func msgToDomain(msg *D.Msg) string {
@@ -175,118 +171,12 @@ func msgToDomain(msg *D.Msg) string {
 	return ""
 }
 
-type dialHandler func(ctx context.Context, network, addr string) (net.Conn, error)
-
-func getDialHandler(r *Resolver, proxyAdapter C.ProxyAdapter, proxyName string, opts ...dialer.Option) dialHandler {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if len(proxyName) == 0 && proxyAdapter == nil {
-			opts = append(opts, dialer.WithResolver(r))
-			return dialer.DialContext(ctx, network, addr, opts...)
-		} else {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			uintPort, err := strconv.ParseUint(port, 10, 16)
-			if err != nil {
-				return nil, err
-			}
-			if proxyAdapter == nil {
-				var ok bool
-				proxyAdapter, ok = tunnel.Proxies()[proxyName]
-				if !ok {
-					opts = append(opts, dialer.WithInterface(proxyName))
-				}
-			}
-
-			if strings.Contains(network, "tcp") {
-				// tcp can resolve host by remote
-				metadata := &C.Metadata{
-					NetWork: C.TCP,
-					Host:    host,
-					DstPort: uint16(uintPort),
-				}
-				if proxyAdapter != nil {
-					if proxyAdapter.IsL3Protocol(metadata) { // L3 proxy should resolve domain before to avoid loopback
-						dstIP, err := resolver.ResolveIPWithResolver(ctx, host, r)
-						if err != nil {
-							return nil, err
-						}
-						metadata.Host = ""
-						metadata.DstIP = dstIP
-					}
-					return proxyAdapter.DialContext(ctx, metadata, opts...)
-				}
-				opts = append(opts, dialer.WithResolver(r))
-				return dialer.DialContext(ctx, network, addr, opts...)
-			} else {
-				// udp must resolve host first
-				dstIP, err := resolver.ResolveIPWithResolver(ctx, host, r)
-				if err != nil {
-					return nil, err
-				}
-				metadata := &C.Metadata{
-					NetWork: C.UDP,
-					Host:    "",
-					DstIP:   dstIP,
-					DstPort: uint16(uintPort),
-				}
-				if proxyAdapter == nil {
-					return dialer.DialContext(ctx, network, addr, opts...)
-				}
-
-				if !proxyAdapter.SupportUDP() {
-					return nil, fmt.Errorf("proxy adapter [%s] UDP is not supported", proxyAdapter)
-				}
-
-				packetConn, err := proxyAdapter.ListenPacketContext(ctx, metadata, opts...)
-				if err != nil {
-					return nil, err
-				}
-
-				return N.NewBindPacketConn(packetConn, metadata.UDPAddr()), nil
-			}
-		}
+func msgToQtype(msg *D.Msg) (uint16, string) {
+	if len(msg.Question) > 0 {
+		qType := msg.Question[0].Qtype
+		return qType, D.Type(qType).String()
 	}
-}
-
-func listenPacket(ctx context.Context, proxyAdapter C.ProxyAdapter, proxyName string, network string, addr string, r *Resolver, opts ...dialer.Option) (net.PacketConn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-	uintPort, err := strconv.ParseUint(port, 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	if proxyAdapter == nil {
-		var ok bool
-		proxyAdapter, ok = tunnel.Proxies()[proxyName]
-		if !ok {
-			opts = append(opts, dialer.WithInterface(proxyName))
-		}
-	}
-
-	// udp must resolve host first
-	dstIP, err := resolver.ResolveIPWithResolver(ctx, host, r)
-	if err != nil {
-		return nil, err
-	}
-	metadata := &C.Metadata{
-		NetWork: C.UDP,
-		Host:    "",
-		DstIP:   dstIP,
-		DstPort: uint16(uintPort),
-	}
-	if proxyAdapter == nil {
-		return dialer.NewDialer(opts...).ListenPacket(ctx, network, "", netip.AddrPortFrom(metadata.DstIP, metadata.DstPort))
-	}
-
-	if !proxyAdapter.SupportUDP() {
-		return nil, fmt.Errorf("proxy adapter [%s] UDP is not supported", proxyAdapter)
-	}
-
-	return proxyAdapter.ListenPacketContext(ctx, metadata, opts...)
+	return 0, ""
 }
 
 func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, cache bool, err error) {
@@ -294,6 +184,7 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 	fast, ctx := picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)
 	defer fast.Close()
 	domain := msgToDomain(m)
+	qType, qTypeStr := msgToQtype(m)
 	var noIpMsg *D.Msg
 	for _, client := range clients {
 		if _, isRCodeClient := client.(rcodeClient); isRCodeClient {
@@ -302,7 +193,7 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 		}
 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
 		fast.Go(func() (*D.Msg, error) {
-			log.Debugln("[DNS] resolve %s from %s", domain, client.Address())
+			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
 			m, err := client.ExchangeContext(ctx, m)
 			if err != nil {
 				return nil, err
@@ -311,20 +202,18 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 				// so we would ignore RCode errors from RCode clients.
 				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
 			}
-			if ips := msgToIP(m); len(m.Question) > 0 {
-				qType := m.Question[0].Qtype
-				log.Debugln("[DNS] %s --> %s %s from %s", domain, ips, D.Type(qType), client.Address())
-				switch qType {
-				case D.TypeAAAA:
-					if len(ips) == 0 {
-						noIpMsg = m
-						return nil, resolver.ErrIPNotFound
-					}
-				case D.TypeA:
-					if len(ips) == 0 {
-						noIpMsg = m
-						return nil, resolver.ErrIPNotFound
-					}
+			ips := msgToIP(m)
+			log.Debugln("[DNS] %s --> %s %s from %s", domain, ips, qTypeStr, client.Address())
+			switch qType {
+			case D.TypeAAAA:
+				if len(ips) == 0 {
+					noIpMsg = m
+					return nil, resolver.ErrIPNotFound
+				}
+			case D.TypeA:
+				if len(ips) == 0 {
+					noIpMsg = m
+					return nil, resolver.ErrIPNotFound
 				}
 			}
 			return m, nil

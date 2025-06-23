@@ -7,17 +7,16 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/queue"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
-	"github.com/metacubex/mihomo/component/dialer"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/puzpuzpuz/xsync/v3"
 )
 
@@ -39,6 +38,11 @@ type Proxy struct {
 	extra   *xsync.MapOf[string, *internalProxyState]
 }
 
+// Adapter implements C.Proxy
+func (p *Proxy) Adapter() C.ProxyAdapter {
+	return p.ProxyAdapter
+}
+
 // AliveForTestUrl implements C.Proxy
 func (p *Proxy) AliveForTestUrl(url string) bool {
 	if state, ok := p.extra.Load(url); ok {
@@ -56,8 +60,8 @@ func (p *Proxy) Dial(metadata *C.Metadata) (C.Conn, error) {
 }
 
 // DialContext implements C.ProxyAdapter
-func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.Conn, error) {
-	conn, err := p.ProxyAdapter.DialContext(ctx, metadata, opts...)
+func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	conn, err := p.ProxyAdapter.DialContext(ctx, metadata)
 	return conn, err
 }
 
@@ -69,8 +73,8 @@ func (p *Proxy) DialUDP(metadata *C.Metadata) (C.PacketConn, error) {
 }
 
 // ListenPacketContext implements C.ProxyAdapter
-func (p *Proxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.PacketConn, error) {
-	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata, opts...)
+func (p *Proxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	pc, err := p.ProxyAdapter.ListenPacketContext(ctx, metadata)
 	return pc, err
 }
 
@@ -156,8 +160,17 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["alive"] = p.alive.Load()
 	mapping["name"] = p.Name()
 	mapping["udp"] = p.SupportUDP()
-	mapping["xudp"] = p.SupportXUDP()
-	mapping["tfo"] = p.SupportTFO()
+	mapping["uot"] = p.SupportUOT()
+
+	proxyInfo := p.ProxyInfo()
+	mapping["xudp"] = proxyInfo.XUDP
+	mapping["tfo"] = proxyInfo.TFO
+	mapping["mptcp"] = proxyInfo.MPTCP
+	mapping["smux"] = proxyInfo.SMUX
+	mapping["interface"] = proxyInfo.Interface
+	mapping["dialer-proxy"] = proxyInfo.DialerProxy
+	mapping["routing-mark"] = proxyInfo.RoutingMark
+
 	return json.Marshal(mapping)
 }
 
@@ -255,10 +268,18 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 
 	if unifiedDelay {
 		second := time.Now()
-		resp, err = client.Do(req)
-		if err == nil {
+		var ignoredErr error
+		var secondResp *http.Response
+		secondResp, ignoredErr = client.Do(req)
+		if ignoredErr == nil {
+			resp = secondResp
 			_ = resp.Body.Close()
 			start = second
+		} else {
+			if strings.HasPrefix(url, "http://") {
+				log.Errorln("%s failed to get the second response from %s: %v", p.Name(), url, ignoredErr)
+				log.Warnln("It is recommended to use HTTPS for provider.health-check.url and group.url to ensure better reliability. Due to some proxy providers hijacking test addresses and not being compatible with repeated HEAD requests, using HTTP may result in failed tests.")
+			}
 		}
 	}
 
@@ -266,6 +287,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 	t = uint16(time.Since(start) / time.Millisecond)
 	return
 }
+
 func NewProxy(adapter C.ProxyAdapter) *Proxy {
 	return &Proxy{
 		ProxyAdapter: adapter,
@@ -292,15 +314,7 @@ func urlToMetadata(rawURL string) (addr C.Metadata, err error) {
 			return
 		}
 	}
-	uintPort, err := strconv.ParseUint(port, 10, 16)
-	if err != nil {
-		return
-	}
 
-	addr = C.Metadata{
-		Host:    u.Hostname(),
-		DstIP:   netip.Addr{},
-		DstPort: uint16(uintPort),
-	}
+	err = addr.SetRemoteAddress(net.JoinHostPort(u.Hostname(), port))
 	return
 }

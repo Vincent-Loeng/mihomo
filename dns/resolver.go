@@ -4,34 +4,32 @@ import (
 	"context"
 	"errors"
 	"net/netip"
-	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/common/arc"
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/common/singleflight"
 	"github.com/metacubex/mihomo/component/fakeip"
-	"github.com/metacubex/mihomo/component/geodata/router"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/trie"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
 
 	D "github.com/miekg/dns"
 	"github.com/samber/lo"
-	orderedmap "github.com/wk8/go-ordered-map/v2"
 	"golang.org/x/exp/maps"
-	"golang.org/x/sync/singleflight"
 )
 
 type dnsClient interface {
 	ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error)
 	Address() string
+	ResetConnection()
 }
 
 type dnsCache interface {
 	GetWithExpire(key string) (*D.Msg, time.Time, bool)
 	SetWithExpire(key string, value *D.Msg, expire time.Time)
+	Clear()
 }
 
 type result struct {
@@ -45,12 +43,12 @@ type Resolver struct {
 	hosts                 *trie.DomainTrie[resolver.HostValue]
 	main                  []dnsClient
 	fallback              []dnsClient
-	fallbackDomainFilters []fallbackDomainFilter
-	fallbackIPFilters     []fallbackIPFilter
-	group                 singleflight.Group
+	fallbackDomainFilters []C.DomainMatcher
+	fallbackIPFilters     []C.IpMatcher
+	group                 singleflight.Group[*D.Msg]
 	cache                 dnsCache
 	policy                []dnsPolicy
-	proxyServer           []dnsClient
+	defaultResolver       *Resolver
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -122,11 +120,33 @@ func (r *Resolver) LookupIPv6(ctx context.Context, host string) ([]netip.Addr, e
 
 func (r *Resolver) shouldIPFallback(ip netip.Addr) bool {
 	for _, filter := range r.fallbackIPFilters {
-		if filter.Match(ip) {
+		if filter.MatchIp(ip) {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) {
+	query := &D.Msg{}
+	query.SetQuestion(D.Fqdn(host), D.TypeHTTPS)
+
+	msg, err := r.ExchangeContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, rr := range msg.Answer {
+		switch resource := rr.(type) {
+		case *D.HTTPS:
+			for _, value := range resource.Value {
+				if echConfig, ok := value.(*D.SVCBECHConfig); ok {
+					return echConfig.ECH, nil
+				}
+			}
+		}
+	}
+	return nil, errors.New("no ECH config found in DNS records")
 }
 
 // ExchangeContext a batch of dns request with context.Context, and it use cache
@@ -146,9 +166,12 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	}()
 
 	q := m.Question[0]
+	domain := msgToDomain(m)
+	_, qTypeStr := msgToQtype(m)
 	cacheM, expireTime, hit := r.cache.GetWithExpire(q.String())
 	if hit {
-		log.Debugln("[DNS] cache hit for %s, expire at %s", q.Name, expireTime.Format("2006-01-02 15:04:05"))
+		ips := msgToIP(cacheM)
+		log.Debugln("[DNS] cache hit %s --> %s %s, expire at %s", domain, ips, qTypeStr, expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
 		msg = cacheM.Copy()
 		if expireTime.Before(now) {
@@ -169,19 +192,20 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 
 	retryNum := 0
 	retryMax := 3
-	fn := func() (result any, err error) {
+	fn := func() (result *D.Msg, err error) {
 		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
 		defer cancel()
 		cache := false
 
 		defer func() {
 			if err != nil {
-				result = retryNum
+				result = &D.Msg{}
+				result.Opcode = retryNum
 				retryNum++
 				return
 			}
 
-			msg := result.(*D.Msg)
+			msg := result
 
 			if cache {
 				// OPT RRs MUST NOT be cached, forwarded, or stored in or loaded from master files.
@@ -208,7 +232,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 
 	ch := r.group.DoChan(q.String(), fn)
 
-	var result singleflight.Result
+	var result singleflight.Result[*D.Msg]
 
 	select {
 	case result = <-ch:
@@ -221,7 +245,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			go func() { // start a retrying monitor in background
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
-				if err != nil && !shared && ret.(int) < retryMax { // retry
+				if err != nil && !shared && ret.Opcode < retryMax { // retry
 					r.group.DoChan(q.String(), fn)
 				}
 			}()
@@ -230,12 +254,12 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 	}
 
 	ret, err, shared := result.Val, result.Err, result.Shared
-	if err != nil && !shared && ret.(int) < retryMax { // retry
+	if err != nil && !shared && ret.Opcode < retryMax { // retry
 		r.group.DoChan(q.String(), fn)
 	}
 
 	if err == nil {
-		msg = ret.(*D.Msg)
+		msg = ret
 		if shared {
 			msg = msg.Copy()
 		}
@@ -274,7 +298,7 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 	}
 
 	for _, df := range r.fallbackDomainFilters {
-		if df.Match(domain) {
+		if df.MatchDomain(domain) {
 			return true
 		}
 	}
@@ -324,7 +348,8 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) (ips []netip.Addr, err error) {
 	ip, err := netip.ParseAddr(host)
 	if err == nil {
-		isIPv4 := ip.Is4() || ip.Is4In6()
+		ip = ip.Unmap()
+		isIPv4 := ip.Is4()
 		if dnsType == D.TypeAAAA && !isIPv4 {
 			return []netip.Addr{ip}, nil
 		} else if dnsType == D.TypeA && isIPv4 {
@@ -368,10 +393,29 @@ func (r *Resolver) Invalid() bool {
 	return len(r.main) > 0
 }
 
+func (r *Resolver) ClearCache() {
+	if r != nil && r.cache != nil {
+		r.cache.Clear()
+	}
+}
+
+func (r *Resolver) ResetConnection() {
+	if r != nil {
+		for _, c := range r.main {
+			c.ResetConnection()
+		}
+		for _, c := range r.fallback {
+			c.ResetConnection()
+		}
+		if dr := r.defaultResolver; dr != nil {
+			dr.ResetConnection()
+		}
+	}
+}
+
 type NameServer struct {
 	Net          string
 	Addr         string
-	Interface    string
 	ProxyAdapter C.ProxyAdapter
 	ProxyName    string
 	Params       map[string]string
@@ -385,7 +429,6 @@ func (ns NameServer) Equal(ns2 NameServer) bool {
 	}()
 	if ns.Net == ns2.Net &&
 		ns.Addr == ns2.Addr &&
-		ns.Interface == ns2.Interface &&
 		ns.ProxyAdapter == ns2.ProxyAdapter &&
 		ns.ProxyName == ns2.ProxyName &&
 		maps.Equal(ns.Params, ns2.Params) &&
@@ -395,39 +438,59 @@ func (ns NameServer) Equal(ns2 NameServer) bool {
 	return false
 }
 
-type FallbackFilter struct {
-	GeoIP     bool
-	GeoIPCode string
-	IPCIDR    []netip.Prefix
-	Domain    []string
-	GeoSite   []router.DomainMatcher
+type Policy struct {
+	Domain      string
+	Matcher     C.DomainMatcher
+	NameServers []NameServer
 }
 
 type Config struct {
-	Main, Fallback []NameServer
-	Default        []NameServer
-	ProxyServer    []NameServer
-	IPv6           bool
-	IPv6Timeout    uint
-	EnhancedMode   C.DNSMode
-	FallbackFilter FallbackFilter
-	Pool           *fakeip.Pool
-	Hosts          *trie.DomainTrie[resolver.HostValue]
-	Policy         *orderedmap.OrderedMap[string, []NameServer]
-	RuleProviders  map[string]provider.RuleProvider
-	CacheAlgorithm string
+	Main, Fallback       []NameServer
+	Default              []NameServer
+	ProxyServer          []NameServer
+	DirectServer         []NameServer
+	DirectFollowPolicy   bool
+	IPv6                 bool
+	IPv6Timeout          uint
+	EnhancedMode         C.DNSMode
+	FallbackIPFilter     []C.IpMatcher
+	FallbackDomainFilter []C.DomainMatcher
+	Pool                 *fakeip.Pool
+	Hosts                *trie.DomainTrie[resolver.HostValue]
+	Policy               []Policy
+	CacheAlgorithm       string
 }
 
-func NewResolver(config Config) *Resolver {
-	var cache dnsCache
-	if config.CacheAlgorithm == "lru" {
-		cache = lru.New(lru.WithSize[string, *D.Msg](4096), lru.WithStale[string, *D.Msg](true))
+func (config Config) newCache() dnsCache {
+	if config.CacheAlgorithm == "" || config.CacheAlgorithm == "lru" {
+		return lru.New(lru.WithSize[string, *D.Msg](4096), lru.WithStale[string, *D.Msg](true))
 	} else {
-		cache = arc.New(arc.WithSize[string, *D.Msg](4096))
+		return arc.New(arc.WithSize[string, *D.Msg](4096))
 	}
+}
+
+type Resolvers struct {
+	*Resolver
+	ProxyResolver  *Resolver
+	DirectResolver *Resolver
+}
+
+func (rs Resolvers) ClearCache() {
+	rs.Resolver.ClearCache()
+	rs.ProxyResolver.ClearCache()
+	rs.DirectResolver.ClearCache()
+}
+
+func (rs Resolvers) ResetConnection() {
+	rs.Resolver.ResetConnection()
+	rs.ProxyResolver.ResetConnection()
+	rs.DirectResolver.ResetConnection()
+}
+
+func NewResolver(config Config) (rs Resolvers) {
 	defaultResolver := &Resolver{
 		main:        transform(config.Default, nil),
-		cache:       cache,
+		cache:       config.newCache(),
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 	}
 
@@ -458,28 +521,43 @@ func NewResolver(config Config) *Resolver {
 		return
 	}
 
-	if config.CacheAlgorithm == "" || config.CacheAlgorithm == "lru" {
-		cache = lru.New(lru.WithSize[string, *D.Msg](4096), lru.WithStale[string, *D.Msg](true))
-	} else {
-		cache = arc.New(arc.WithSize[string, *D.Msg](4096))
-	}
 	r := &Resolver{
 		ipv6:        config.IPv6,
 		main:        cacheTransform(config.Main),
-		cache:       cache,
+		cache:       config.newCache(),
 		hosts:       config.Hosts,
 		ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+	}
+	r.defaultResolver = defaultResolver
+	rs.Resolver = r
+
+	if len(config.ProxyServer) != 0 {
+		rs.ProxyResolver = &Resolver{
+			ipv6:        config.IPv6,
+			main:        cacheTransform(config.ProxyServer),
+			cache:       config.newCache(),
+			hosts:       config.Hosts,
+			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+		}
+	}
+
+	if len(config.DirectServer) != 0 {
+		rs.DirectResolver = &Resolver{
+			ipv6:        config.IPv6,
+			main:        cacheTransform(config.DirectServer),
+			cache:       config.newCache(),
+			hosts:       config.Hosts,
+			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
+		}
 	}
 
 	if len(config.Fallback) != 0 {
 		r.fallback = cacheTransform(config.Fallback)
+		r.fallbackIPFilters = config.FallbackIPFilter
+		r.fallbackDomainFilters = config.FallbackDomainFilter
 	}
 
-	if len(config.ProxyServer) != 0 {
-		r.proxyServer = cacheTransform(config.ProxyServer)
-	}
-
-	if config.Policy.Len() != 0 {
+	if len(config.Policy) != 0 {
 		r.policy = make([]dnsPolicy, 0)
 
 		var triePolicy *trie.DomainTrie[[]dnsClient]
@@ -494,87 +572,24 @@ func NewResolver(config Config) *Resolver {
 			}
 		}
 
-		for pair := config.Policy.Oldest(); pair != nil; pair = pair.Next() {
-			domain, nameserver := pair.Key, pair.Value
-
-			if temp := strings.Split(domain, ":"); len(temp) == 2 {
-				prefix := temp[0]
-				key := temp[1]
-				switch prefix {
-				case "rule-set":
-					if p, ok := config.RuleProviders[key]; ok {
-						log.Debugln("Adding rule-set policy: %s ", key)
-						insertPolicy(domainSetPolicy{
-							domainSetProvider: p,
-							dnsClients:        cacheTransform(nameserver),
-						})
-						continue
-					} else {
-						log.Warnln("Can't found ruleset policy: %s", key)
-					}
-				case "geosite":
-					inverse := false
-					if strings.HasPrefix(key, "!") {
-						inverse = true
-						key = key[1:]
-					}
-					log.Debugln("Adding geosite policy: %s inversed %t", key, inverse)
-					matcher, err := NewGeoSite(key)
-					if err != nil {
-						log.Warnln("adding geosite policy %s error: %s", key, err)
-						continue
-					}
-					insertPolicy(geositePolicy{
-						matcher:    matcher,
-						inverse:    inverse,
-						dnsClients: cacheTransform(nameserver),
-					})
-					continue // skip triePolicy new
+		for _, policy := range config.Policy {
+			if policy.Matcher != nil {
+				insertPolicy(domainMatcherPolicy{matcher: policy.Matcher, dnsClients: cacheTransform(policy.NameServers)})
+			} else {
+				if triePolicy == nil {
+					triePolicy = trie.New[[]dnsClient]()
 				}
+				_ = triePolicy.Insert(policy.Domain, cacheTransform(policy.NameServers))
 			}
-			if triePolicy == nil {
-				triePolicy = trie.New[[]dnsClient]()
-			}
-			_ = triePolicy.Insert(domain, cacheTransform(nameserver))
 		}
 		insertPolicy(nil)
+
+		if rs.DirectResolver != nil && config.DirectFollowPolicy {
+			rs.DirectResolver.policy = r.policy
+		}
 	}
 
-	fallbackIPFilters := []fallbackIPFilter{}
-	if config.FallbackFilter.GeoIP {
-		fallbackIPFilters = append(fallbackIPFilters, &geoipFilter{
-			code: config.FallbackFilter.GeoIPCode,
-		})
-	}
-	for _, ipnet := range config.FallbackFilter.IPCIDR {
-		fallbackIPFilters = append(fallbackIPFilters, &ipnetFilter{ipnet: ipnet})
-	}
-	r.fallbackIPFilters = fallbackIPFilters
-
-	fallbackDomainFilters := []fallbackDomainFilter{}
-	if len(config.FallbackFilter.Domain) != 0 {
-		fallbackDomainFilters = append(fallbackDomainFilters, NewDomainFilter(config.FallbackFilter.Domain))
-	}
-
-	if len(config.FallbackFilter.GeoSite) != 0 {
-		fallbackDomainFilters = append(fallbackDomainFilters, &geoSiteFilter{
-			matchers: config.FallbackFilter.GeoSite,
-		})
-	}
-	r.fallbackDomainFilters = fallbackDomainFilters
-
-	return r
-}
-
-func NewProxyServerHostResolver(old *Resolver) *Resolver {
-	r := &Resolver{
-		ipv6:        old.ipv6,
-		main:        old.proxyServer,
-		cache:       old.cache,
-		hosts:       old.hosts,
-		ipv6Timeout: old.ipv6Timeout,
-	}
-	return r
+	return
 }
 
 var ParseNameServer func(servers []string) ([]NameServer, error) // define in config/config.go
