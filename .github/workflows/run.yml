@@ -40,8 +40,6 @@ jobs:
           cd sing-tun
           patch -p1 < ../sing-tun.patch
           cp monitor_darwin.go monitor_freebsd.go
-          cp tun_darwin_gvisor.go tun_freebsd_gvisor.go
-          sed -i 's|DarwinEndpoint|FreeBSDEndpoint|g;s|darwin|freebsd|g' tun_freebsd_gvisor.go
           cd ../mihomo
           patch -p1 < ../mihomo.patch
           sing_tun_version=$(cat go.mod | grep github.com/metacubex/sing-tun | awk '{ print $2 }')
