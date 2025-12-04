@@ -22,8 +22,9 @@ jobs:
 
       - name: Set variables
         run: |
-          echo "RELEASE_NAME=Alpha-vincent-$(date +%Y%m%d)" >> $GITHUB_ENV
-          echo "TAG_NAME=Alpha-vincent-$(date +%Y%m%d)" >> $GITHUB_ENV
+          latest_version=$(curl -sSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name' | sed 's|v||g')
+          echo "RELEASE_NAME=${latest_version}-vincent" >> $GITHUB_ENV
+          echo "TAG_NAME=v${latest_version}-vincent" >> $GITHUB_ENV
           echo "tags=with_gvisor" >> $GITHUB_ENV
         shell: bash
 
@@ -35,7 +36,7 @@ jobs:
       - name: Apply patches
         run: |
           git clone --depth 1 https://github.com/MetaCubeX/sing-tun.git sing-tun
-          git clone --depth 1 -b Alpha https://github.com/MetaCubeX/mihomo.git mihomo
+          git clone --depth 1 -b Meta https://github.com/MetaCubeX/mihomo.git mihomo
           ls -lha
           cd sing-tun
           patch -p1 < ../sing-tun.patch
@@ -45,7 +46,6 @@ jobs:
           sing_tun_version=$(cat go.mod | grep github.com/metacubex/sing-tun | awk '{ print $2 }')
           echo -e "\nreplace github.com/metacubex/sing-tun ${sing_tun_version} => ../sing-tun" >> go.mod
           git_head=$(git rev-parse --short HEAD)
-          echo "version=Alpha-${git_head}-vincent" >> $GITHUB_ENV
 
       - name: Check for new version
         run: |
@@ -54,9 +54,9 @@ jobs:
           else
             LAST_VERSION="none"
           fi
-          echo "Last version: ${LAST_VERSION}, current version: ${{ env.version }}"
-          if [ "${{ env.version }}" != "${LAST_VERSION}" ]; then
-            echo "${{ env.version }}" > last_version
+          echo "Last version: ${LAST_VERSION}, current version: ${RELEASE_NAME}"
+          if [ "${{ env.RELEASE_NAME }}" != "${LAST_VERSION}" ]; then
+            echo "${{ env.RELEASE_NAME }}" > last_version
             echo "BUILD=true" >> $GITHUB_ENV
           else
             echo "BUILD=false" >> $GITHUB_ENV
@@ -76,7 +76,7 @@ jobs:
           arch_array=(amd64 386 arm64 arm)
           for os in ${os_array[@]}; do
             for arch in ${arch_array[@]}; do
-              GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -v -tags ${tags} -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=${{ env.version }}" -X "github.com/metacubex/mihomo/constant.BuildTime=none" -w -s -buildid=' -o mihomo
+              GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -v -tags ${tags} -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=${{ env.RELEASE_NAME }}" -X "github.com/metacubex/mihomo/constant.BuildTime=none" -w -s -buildid=' -o mihomo
               mv mihomo mihomo-${os}-${arch}
             done
           done
@@ -106,7 +106,7 @@ jobs:
           git config --local user.name "Vincent Loeng"
           git config --local user.email "173226116+Vincent-Loeng@users.noreply.github.com"
           git add last_version
-          git commit -m "Release ${{ env.version }}"
+          git commit -m "Release ${{ env.RELEASE_NAME }}"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
