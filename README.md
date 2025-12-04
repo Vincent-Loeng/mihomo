@@ -10,9 +10,9 @@
 
 # mihomo for FreeBSD (with tun support)
 
-Automatically build the latest Alpha version with patches
+Automatically build the latest version with patches
 
-自动使用补丁构建最新的 Alpha 版本
+自动使用补丁构建最新的版本
 
 ## Another tool 另一工具 [**sing-box for FreeBSD/OpenBSD**](https://github.com/Vincent-Loeng/sing-box)
 
