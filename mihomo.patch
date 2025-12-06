@@ -1,11 +1,11 @@
 diff --git a/component/process/process_freebsd_amd64.go b/component/process/process_freebsd.go
-similarity index 89%
+similarity index 90%
 rename from component/process/process_freebsd_amd64.go
 rename to component/process/process_freebsd.go
-index cb43c5ff..a7ca5c76 100644
+index a6d00c8e..a7ca5c76 100644
 --- a/component/process/process_freebsd_amd64.go
 +++ b/component/process/process_freebsd.go
-@@ -177,33 +177,31 @@ func (s *searcher) searchSocketPid(socket uint64) (uint32, error) {
+@@ -177,23 +177,9 @@ func (s *searcher) searchSocketPid(socket uint64) (uint32, error) {
  	return 0, ErrNotFound
  }
  
@@ -30,10 +30,10 @@ index cb43c5ff..a7ca5c76 100644
  	case 12:
  		fallthrough
  	case 13:
-+		fallthrough
-+	case 14:
-+		fallthrough
-+	case 15:
+@@ -201,13 +187,21 @@ func newSearcher(major int) *searcher {
+ 	case 14:
+ 		fallthrough
+ 	case 15:
 +		var vflag int
 +		if machine == "i386" {
 +			vflag = 388
@@ -53,7 +53,7 @@ index cb43c5ff..a7ca5c76 100644
  			socket:       16,
  			fileItemSize: 128,
  			data:         56,
-@@ -218,6 +216,10 @@ func initSearcher() error {
+@@ -222,6 +216,10 @@ func initSearcher() error {
  	if err != nil {
  		return err
  	}
@@ -64,7 +64,7 @@ index cb43c5ff..a7ca5c76 100644
  
  	dot := strings.Index(osRelease, ".")
  	if dot != -1 {
-@@ -227,9 +229,9 @@ func initSearcher() error {
+@@ -231,9 +229,9 @@ func initSearcher() error {
  	if err != nil {
  		return err
  	}
