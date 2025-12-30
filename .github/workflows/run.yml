@@ -54,7 +54,7 @@ jobs:
             echo "${{ env.version }}" > last_version
             echo "BUILD=true" >> $GITHUB_ENV
           else
-            echo "BUILD=true" >> $GITHUB_ENV
+            echo "BUILD=false" >> $GITHUB_ENV
           fi
 
       - name: Apply patches
