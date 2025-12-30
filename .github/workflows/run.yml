@@ -13,6 +13,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os: freebsd, arch: riscv64 }
+          - { os: freebsd, arch: amd64}
+          - { os: freebsd, arch: 386 }
+          - { os: freebsd, arch: arm64}
+
     steps:
       - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@main
@@ -46,7 +54,7 @@ jobs:
             echo "${{ env.version }}" > last_version
             echo "BUILD=true" >> $GITHUB_ENV
           else
-            echo "BUILD=false" >> $GITHUB_ENV
+            echo "BUILD=true" >> $GITHUB_ENV
           fi
 
       - name: Apply patches
@@ -71,25 +79,24 @@ jobs:
         with:
           go-version: 'stable'
 
-      - name: Build binary files
+      - name: Build binary file
         if: ${{ env.BUILD == 'true' }}
         run: |
           cd mihomo
-          os_array=(freebsd)
-          arch_array=(riscv64 amd64 386 arm64)
-          for os in ${os_array[@]}; do
-            for arch in ${arch_array[@]}; do
-              GOOS=${os} GOARCH=${arch} CGO_ENABLED=0 go build -v -tags ${tags} -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=${{ env.RELEASE_NAME }}" -X "github.com/metacubex/mihomo/constant.BuildTime=none" -w -s -buildid=' -o mihomo
-              mv mihomo mihomo-${os}-${arch}
-              xz -v mihomo-${os}-${arch}
-            done
-          done
+          go build -v -tags ${tags} -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=${{ env.RELEASE_NAME }}" -X "github.com/metacubex/mihomo/constant.BuildTime=none" -w -s -buildid=' -o mihomo
+          mv mihomo mihomo-${{ matrix.os }}-${{ matrix.arch }}
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
 
-      - name: Move files to publish directory
+      - name: Compress and move file to publish directory
         if: ${{ env.BUILD == 'true' }}
         run: |
-          mkdir -p publish
-          cp mihomo/mihomo-* ./publish/
+          cd mihomo
+          xz -v mihomo-${{ matrix.os }}-${{ matrix.arch }}
+          mkdir -p ../publish
+          cp -v mihomo-* ../publish/
 
       - name: Release and upload assets
         if: ${{ env.BUILD == 'true' }}
@@ -104,6 +111,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  push:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
       - name: Push last_version to "hidden" branch
         if: ${{ env.BUILD == 'true' }}
         run: |
