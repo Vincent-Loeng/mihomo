@@ -1,3 +1,35 @@
+diff --git a/Makefile b/Makefile
+index 3efdba9..7263095 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,6 +7,7 @@ build:
+ 	GOOS=linux GOARCH=arm go build -v -tags with_gvisor .
+ 	GOOS=android GOARCH=arm64 go build -v -tags with_gvisor .
+ 	GOOS=windows GOARCH=amd64 go build -v -tags with_gvisor .
++	GOOS=freebsd GOARCH=amd64 go build -v -tags with_gvisor .
+ 
+ fmt:
+ 	@gofumpt -l -w .
+diff --git a/README.md b/README.md
+index 6a8a9c0..c420662 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,7 @@
+ 
+ Simple transparent proxy library.
+ 
+-For Linux, Windows, macOS and iOS.
++For Linux, Windows, FreeBSD, macOS and iOS.
+ 
+ ## License
+ 
+@@ -21,4 +21,4 @@ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with this program. If not, see <http://www.gnu.org/licenses/>.
+-```
+\ No newline at end of file
++```
 diff --git a/monitor_other.go b/monitor_other.go
 index 40a936e..f4e0b33 100644
 --- a/monitor_other.go
@@ -58,10 +90,10 @@ index fdcc548..4e38fd9 100644
  			if HasNextAddress(o.Inet6Address[0], 1) {
 diff --git a/tun_freebsd.go b/tun_freebsd.go
 new file mode 100644
-index 0000000..1100a6f
+index 0000000..2f5325f
 --- /dev/null
 +++ b/tun_freebsd.go
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,624 @@
 +package tun
 +
 +import (
@@ -235,11 +267,11 @@ index 0000000..1100a6f
 +
 +const (
 +	TUNSIFHEAD             = 0x80047460 // net/if_tun.h
-+	TUNSIFMODE             = 0x8004745e // net/if_tun.h
-+	TUNGIFNAME             = 0x4020745d // net/if_tun.h
-+	TUNSIFPID              = 0x2000745f // net/if_tun.h
-+	SIOCGIFINFO_IN6        = 0xc048696c // netinet6/in6_var.h
-+	SIOCSIFINFO_IN6        = 0xc048696d // netinet6/in6_var.h
++	TUNSIFMODE             = 0x8004745E // net/if_tun.h
++	TUNGIFNAME             = 0x4020745D // net/if_tun.h
++	TUNSIFPID              = 0x2000745F // net/if_tun.h
++	SIOCGIFINFO_IN6        = 0xC048696C // netinet6/in6_var.h
++	SIOCSIFINFO_IN6        = 0xC048696D // netinet6/in6_var.h
 +	ND6_IFF_AUTO_LINKLOCAL = 0x20       // netinet6/nd6.h
 +	ND6_IFF_NO_DAD         = 0x100      // netinet6/nd6.h
 +)
@@ -349,6 +381,9 @@ index 0000000..1100a6f
 +	if fibs < uint32(fibSize) {
 +		err = runCommand(fmt.Sprintf("sysctl net.fibs=%d\n", fibSize))
 +		if err != nil {
++			if strings.Contains(err.Error(), "Tunable values are set in /boot/loader.conf") {
++				return fmt.Errorf("please add `net.fibs=%d` and `net.add_addr_allfibs=1` to /boot/loader.conf, and then reboot", fibSize)
++			}
 +			return err
 +		}
 +	}
@@ -685,12 +720,10 @@ index 0000000..1100a6f
 +}
 diff --git a/tun_freebsd_gvisor.go b/tun_freebsd_gvisor.go
 new file mode 100644
-index 0000000..8cda7a0
+index 0000000..8c14b65
 --- /dev/null
 +++ b/tun_freebsd_gvisor.go
-@@ -0,0 +1,138 @@
-+//go:build with_gvisor && freebsd
-+
+@@ -0,0 +1,136 @@
 +package tun
 +
 +import (
